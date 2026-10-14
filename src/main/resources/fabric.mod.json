@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "mathparkour",
+  "version": "${version}",
+  "name": "Math Parkour",
+  "description": "A multiplication and division parkour game with persistent FSRS spaced repetition, squares, science facts, hub, points and shop.",
+  "authors": ["Math Parkour contributors"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "dev.mathparkour.MathParkourMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.10",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

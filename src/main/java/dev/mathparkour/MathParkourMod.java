@@ -41,8 +41,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Math Parkour with "science-based" learning flow:
- * 2-15 fact range, squares, science facts, interleaving, explanations, points, shop, hub.
+ * Math Parkour with table/mixed selection support: run all facts for a chosen operand (e.g. all 6's), squares, and mixed.
  */
 public final class MathParkourMod implements ModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger("mathparkour");
@@ -90,7 +89,7 @@ public final class MathParkourMod implements ModInitializer {
                 .then(CommandManager.literal("start").executes(context -> {
                     ServerPlayerEntity player = getPlayer(context.getSource());
                     if (player == null) return 0;
-                    startCourse(player, GameMode.MIXED);
+                    startCourse(player, GameMode.MIXED, null);
                     return 1;
                 }))
                 .then(CommandManager.literal("start")
@@ -98,7 +97,8 @@ public final class MathParkourMod implements ModInitializer {
                             ServerPlayerEntity player = getPlayer(context.getSource());
                             if (player == null) return 0;
                             String requested = StringArgumentType.getString(context, "mode");
-                            startCourse(player, GameMode.fromString(requested));
+                            StartSpec spec = parseStartSpec(requested);
+                            startCourse(player, spec.mode(), spec.focusNumber());
                             return 1;
                         })))
                 .then(CommandManager.literal("hub").executes(context -> {
@@ -166,6 +166,37 @@ public final class MathParkourMod implements ModInitializer {
         return null;
     }
 
+    private static StartSpec parseStartSpec(String raw) {
+        if (raw == null) return new StartSpec(GameMode.MIXED, null);
+        String s = raw.trim().toLowerCase();
+        // direct keywords
+        switch (s) {
+            case "math": return new StartSpec(GameMode.MATH, null);
+            case "squares": return new StartSpec(GameMode.SQUARES, null);
+            case "mixed": return new StartSpec(GameMode.MIXED, null);
+        }
+        // numeric like "6" -> all facts involving 6 (multiplication/division)
+        if (s.matches("^\\d{1,2}$")) {
+            try {
+                int n = Integer.parseInt(s);
+                return new StartSpec(GameMode.MATH, n);
+            } catch (NumberFormatException ignored) { }
+        }
+        // patterns: table6, times6, table:6, times:6, sq6
+        if (s.matches("^(table|times|t)[:_\\-]?\\d{1,2}$")) {
+            int n = Integer.parseInt(s.replaceAll("\\D+", ""));
+            return new StartSpec(GameMode.MATH, n);
+        }
+        if (s.matches("^(sq|square|squares)[:_\\-]?\\d{1,2}$")) {
+            int n = Integer.parseInt(s.replaceAll("\\D+", ""));
+            return new StartSpec(GameMode.SQUARES, n);
+        }
+        // fallback to mixed
+        return new StartSpec(GameMode.MIXED, null);
+    }
+
+    private record StartSpec(GameMode mode, Integer focusNumber) {}
+
     private static void buildHub(ServerPlayerEntity player) {
         ServerWorld world = player.getServerWorld();
         int baseX = player.getBlockX() + 5;
@@ -206,12 +237,6 @@ public final class MathParkourMod implements ModInitializer {
         place(world, squarePlate.getX(), squarePlate.getY() + 1, squarePlate.getZ(), Blocks.STONE_PRESSURE_PLATE);
         HUB_ACTIONS.put(squarePlate, HubAction.START_SQUARES);
 
-        // science (green)
-        BlockPos sciencePlate = new BlockPos(baseX + 2, plateY, baseZ + 4);
-        place(world, sciencePlate.getX(), sciencePlate.getY(), sciencePlate.getZ(), Blocks.LIME_CONCRETE);
-        place(world, sciencePlate.getX(), sciencePlate.getY() + 1, sciencePlate.getZ(), Blocks.STONE_PRESSURE_PLATE);
-        HUB_ACTIONS.put(sciencePlate, HubAction.START_SCIENCE);
-
         // mixed (blue)
         BlockPos mixedPlate = new BlockPos(baseX + 5, plateY, baseZ + 4);
         place(world, mixedPlate.getX(), mixedPlate.getY(), mixedPlate.getZ(), Blocks.BLUE_CONCRETE);
@@ -232,14 +257,14 @@ public final class MathParkourMod implements ModInitializer {
 
         teleport(player, baseX + 0.5, baseY + 2.0, baseZ + 0.5);
         player.sendMessage(Text.literal("Hub ready. Stand on a colored pressure plate to start a course or open the shop."), false);
-        player.sendMessage(Text.literal("Red = math, yellow = squares, green = science, blue = mixed, purple = shop, pink = pet summon."), false);
+        player.sendMessage(Text.literal("Red = math, yellow = squares, blue = mixed, purple = shop, pink = pet summon."), false);
     }
 
-    private static void startCourse(ServerPlayerEntity player, GameMode mode) {
+    private static void startCourse(ServerPlayerEntity player, GameMode mode, Integer focusNumber) {
         MinecraftServer server = player.getServer();
         ServerWorld world = player.getServerWorld();
         PlayerProfile profile = ProfileStore.get(server, player.getUuid());
-        List<MathQuestion> chosen = chooseQuestions(profile, QUESTIONS_PER_COURSE, mode);
+        List<MathQuestion> chosen = chooseQuestions(profile, QUESTIONS_PER_COURSE, mode, focusNumber);
         List<DoorRound> rounds = new ArrayList<>();
         for (MathQuestion question : chosen) {
             List<Integer> options = MathQuestion.makeOptions(question, RANDOM);
@@ -260,7 +285,8 @@ public final class MathParkourMod implements ModInitializer {
         ACTIVE_RUNS.put(player.getUuid(), run);
         teleport(player, baseX + 1.5, floorY + 1.0, centerZ + 0.5);
 
-        player.sendMessage(Text.literal("Math Parkour started in " + mode.label + " mode: walk through the colored doors. Wrong doors drop into lava and send you to the checkpoint."), false);
+        String modeLabel = mode.label + (focusNumber == null ? "" : (" (" + focusNumber + ")"));
+        player.sendMessage(Text.literal("Math Parkour started in " + modeLabel + " mode: walk through the colored doors. Wrong doors drop into lava and send you to the checkpoint."), false);
         player.sendMessage(Text.literal("Use /mathparkour hint or /mathparkour stats. Earn points. Spend them in /mathparkour shop."), false);
     }
 
@@ -276,13 +302,16 @@ public final class MathParkourMod implements ModInitializer {
         return floorY <= upperSafeLimit ? floorY : -1;
     }
 
-    private static List<MathQuestion> chooseQuestions(PlayerProfile profile, int count, GameMode mode) {
+    private static List<MathQuestion> chooseQuestions(PlayerProfile profile, int count, GameMode mode, Integer focusNumber) {
         Instant now = Instant.now();
         List<MathQuestion> due = new ArrayList<>();
         List<MathQuestion> fresh = new ArrayList<>();
         List<MathQuestion> future = new ArrayList<>();
 
         for (MathQuestion q : CATALOG) {
+            if (focusNumber != null) {
+                if (!matchesFocus(q, focusNumber)) continue;
+            }
             if (!matchesMode(q, mode)) continue;
 
             if (!profile.cards.containsKey(q.id())) {
@@ -321,6 +350,7 @@ public final class MathParkourMod implements ModInitializer {
         if (result.size() >= count) return result.subList(0, count);
 
         for (MathQuestion q : CATALOG) {
+            if (focusNumber != null && !matchesFocus(q, focusNumber)) continue;
             if (!matchesMode(q, mode) || used.contains(q.id())) continue;
             addUnique(result, used, q);
             if (result.size() >= count) break;
@@ -328,11 +358,20 @@ public final class MathParkourMod implements ModInitializer {
         return result;
     }
 
+    private static boolean matchesFocus(MathQuestion q, int n) {
+        if (q.id().startsWith("mul:") || q.id().startsWith("div:")) {
+            return q.operand1() == n || q.operand2() == n;
+        }
+        if (q.id().startsWith("sq:")) {
+            return q.operand1() == n;
+        }
+        return false;
+    }
+
     private static boolean matchesMode(MathQuestion q, GameMode mode) {
         if (mode == GameMode.MIXED) return true;
         if (mode == GameMode.MATH) return q.id().startsWith("mul:") || q.id().startsWith("div:");
         if (mode == GameMode.SQUARES) return q.id().startsWith("sq:");
-        if (mode == GameMode.SCIENCE) return q.id().startsWith("sci:");
         return true;
     }
 
@@ -621,9 +660,6 @@ public final class MathParkourMod implements ModInitializer {
             int n = q.operand1();
             return n + "² = " + q.answer() + " because " + n + " × " + n + " = " + q.answer() + ".";
         }
-        if (q.id().startsWith("sci:")) {
-            return q.hint();
-        }
         return q.operand1() + " × " + q.operand2() + " = " + q.answer() + ".";
     }
 
@@ -715,10 +751,10 @@ public final class MathParkourMod implements ModInitializer {
     // Hub trigger handler
     private static void triggerHubAction(ServerPlayerEntity player, HubAction action) {
         switch (action) {
-            case START_MATH -> startCourse(player, GameMode.MATH);
-            case START_SQUARES -> startCourse(player, GameMode.SQUARES);
-            case START_SCIENCE -> startCourse(player, GameMode.SCIENCE);
-            case START_MIXED -> startCourse(player, GameMode.MIXED);
+            case START_MATH -> startCourse(player, GameMode.MATH, null);
+            case START_SQUARES -> startCourse(player, GameMode.SQUARES, null);
+            case START_SCIENCE -> startCourse(player, GameMode.MIXED, null); // science removed -> default to mixed
+            case START_MIXED -> startCourse(player, GameMode.MIXED, null);
             case SHOP -> showShop(player);
             case SUMMON_WOLF -> {
                 PlayerProfile profile = ProfileStore.get(player.getServer(), player.getUuid());

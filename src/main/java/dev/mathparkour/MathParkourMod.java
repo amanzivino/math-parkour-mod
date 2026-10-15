@@ -50,6 +50,9 @@ public final class MathParkourMod implements ModInitializer {
     private static final int STAGE_SPACING = 8;
     private static final int GATE_OFFSET = 1;
     private static final int GAP_LENGTH = 3;
+    // How long (in server ticks) the question should flash on the player's action bar when shown.
+    private static final int FLASH_TICKS = 40; // ~2 seconds at 20 TPS
+
     private static final List<MathQuestion> CATALOG = MathQuestion.catalog();
     private static final Random RANDOM = new Random();
     private static final Map<UUID, CourseRun> ACTIVE_RUNS = new ConcurrentHashMap<>();
@@ -491,6 +494,12 @@ public final class MathParkourMod implements ModInitializer {
                 continue;
             }
 
+            // flash the prompt on the action bar while flashTicksLeft > 0
+            if (run.promptShownStage == run.stage && run.flashTicksLeft > 0 && run.current != null) {
+                player.sendMessage(Text.literal(run.current.question.prompt()), true);
+                run.flashTicksLeft--;
+            }
+
             if (player.getY() <= run.floorY - 3.4) {
                 boolean questionMiss = run.fallPending;
                 int checkpointX = run.baseX + run.stage * STAGE_SPACING + 1;
@@ -513,6 +522,7 @@ public final class MathParkourMod implements ModInitializer {
                     && player.getY() <= run.floorY + 4) {
                 showQuestion(player, run.stage, run.current, run.typedMode);
                 run.promptShownStage = run.stage;
+                run.flashTicksLeft = FLASH_TICKS;
             }
 
             if (!run.typedMode && !run.gateResolved && !run.fallPending && isPlayerAtGate(player, run)) {
@@ -627,6 +637,8 @@ public final class MathParkourMod implements ModInitializer {
         private boolean fallPending = false;
         private boolean gateResolved = false;
         private boolean typedMode = false;
+        // remaining ticks to flash the prompt on the action bar
+        private int flashTicksLeft = 0;
 
         private CourseRun(int baseX, int floorY, int centerZ,
                           net.minecraft.registry.RegistryKey<World> dimension, GameMode mode, Integer focusNumber) {

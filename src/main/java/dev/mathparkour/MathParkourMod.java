@@ -1,6 +1,7 @@
 package dev.mathparkour;
 
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import io.github.openspacedrepetition.Rating;
 import net.fabricmc.api.ModInitializer;
@@ -41,19 +42,19 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Math Parkour with table/mixed selection support: run all facts for a chosen operand (e.g. all 6's), squares, and mixed.
+ * Math Parkour — endless runner variant with three doors. Supports focused-table (all 6's/etc), mixed, and typed answer mode.
  */
 public final class MathParkourMod implements ModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger("mathparkour");
 
-    private static final int QUESTIONS_PER_COURSE = 8;
     private static final int STAGE_SPACING = 8;
     private static final int GATE_OFFSET = 1;
     private static final int GAP_LENGTH = 3;
-    private static final int MAX_DUE_PER_COURSE = 4;
     private static final List<MathQuestion> CATALOG = MathQuestion.catalog();
     private static final Random RANDOM = new Random();
     private static final Map<UUID, CourseRun> ACTIVE_RUNS = new ConcurrentHashMap<>();
+    private static final Map<UUID, Boolean> TYPED_MODE = new ConcurrentHashMap<>();
+    private static final Map<UUID, Integer> ACTIVE_CONFIDENCE = new ConcurrentHashMap<>();
 
     private static final Block[] LANE_COLORS = {
             Blocks.RED_WOOL,
@@ -79,6 +80,8 @@ public final class MathParkourMod implements ModInitializer {
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             ProfileStore.flushAll();
             ACTIVE_RUNS.clear();
+            TYPED_MODE.clear();
+            ACTIVE_CONFIDENCE.clear();
             HUB_ACTIONS.clear();
         });
         LOGGER.info("Math Parkour initialized. Use /mathparkour hub to build the launch area.");
@@ -99,6 +102,44 @@ public final class MathParkourMod implements ModInitializer {
                             String requested = StringArgumentType.getString(context, "mode");
                             StartSpec spec = parseStartSpec(requested);
                             startCourse(player, spec.mode(), spec.focusNumber());
+                            return 1;
+                        })))
+                .then(CommandManager.literal("mode")
+                        .then(CommandManager.argument("modeName", StringArgumentType.word()).executes(context -> {
+                            ServerPlayerEntity player = getPlayer(context.getSource());
+                            if (player == null) return 0;
+                            String modeName = StringArgumentType.getString(context, "modeName");
+                            if ("typed".equalsIgnoreCase(modeName)) {
+                                TYPED_MODE.put(player.getUuid(), true);
+                                ACTIVE_CONFIDENCE.putIfAbsent(player.getUuid(), 2);
+                                player.sendMessage(Text.literal("Typed answer mode enabled. Use /mathparkour answer <number> during a run."), false);
+                            } else if ("doors".equalsIgnoreCase(modeName)) {
+                                TYPED_MODE.put(player.getUuid(), false);
+                                player.sendMessage(Text.literal("Door answer mode enabled."), false);
+                            } else {
+                                player.sendMessage(Text.literal("Unknown mode. Use 'typed' or 'doors'."), false);
+                            }
+                            return 1;
+                        })))
+                .then(CommandManager.literal("answer")
+                        .then(CommandManager.argument("value", StringArgumentType.word()).executes(context -> {
+                            ServerPlayerEntity player = getPlayer(context.getSource());
+                            if (player == null) return 0;
+                            String raw = StringArgumentType.getString(context, "value");
+                            try {
+                                handleTypedAnswer(player, Integer.parseInt(raw));
+                            } catch (NumberFormatException e) {
+                                player.sendMessage(Text.literal("Use a whole number, for example: /mathparkour answer 24"), false);
+                            }
+                            return 1;
+                        })))
+                .then(CommandManager.literal("conf")
+                        .then(CommandManager.argument("level", IntegerArgumentType.integer(1, 3)).executes(context -> {
+                            ServerPlayerEntity player = getPlayer(context.getSource());
+                            if (player == null) return 0;
+                            int level = IntegerArgumentType.getInteger(context, "level");
+                            ACTIVE_CONFIDENCE.put(player.getUuid(), level);
+                            player.sendMessage(Text.literal("Confidence set to " + level + " (1 = low, 2 = medium, 3 = high)."), false);
                             return 1;
                         })))
                 .then(CommandManager.literal("hub").executes(context -> {
@@ -125,7 +166,7 @@ public final class MathParkourMod implements ModInitializer {
                     CourseRun removed = ACTIVE_RUNS.remove(player.getUuid());
                     player.sendMessage(Text.literal(removed == null
                             ? "You do not have an active Math Parkour run."
-                            : "Math Parkour stopped. The built course remains in the world."), false);
+                            : "Math Parkour stopped. The built gates remain in the world."), false);
                     return 1;
                 }))
                 .then(CommandManager.literal("shop").executes(context -> {
@@ -159,6 +200,52 @@ public final class MathParkourMod implements ModInitializer {
         );
     }
 
+    private static void handleTypedAnswer(ServerPlayerEntity player, int answer) {
+        CourseRun run = ACTIVE_RUNS.get(player.getUuid());
+        if (run == null) {
+            player.sendMessage(Text.literal("No active run. Use /mathparkour start <mode>."), false);
+            return;
+        }
+        int confidence = ACTIVE_CONFIDENCE.getOrDefault(player.getUuid(), 2);
+        if (answer == run.current.question.answer()) {
+            boolean isFirstReviewForThisPrompt = run.recordedCardIds.add(run.current.question.id());
+            PlayerProfile profile = ProfileStore.get(player.getServer(), player.getUuid());
+            profile.correctChoices++;
+            int confidenceBonus = switch (confidence) {
+                case 1 -> 0;
+                case 2 -> 3;
+                case 3 -> 6;
+                default -> 3;
+            };
+            int earned = 5 + confidenceBonus + (isFirstReviewForThisPrompt ? 5 : 0);
+            earnPoints(profile, earned);
+            if (isFirstReviewForThisPrompt) {
+                profile.firstTryCorrect++;
+                FsrsReviews.rate(profile, run.current.question.id(), Rating.GOOD);
+            }
+            ProfileStore.save(player.getServer(), player.getUuid());
+            player.sendMessage(Text.literal("Correct! +" + earned + " points (confidence " + confidence + "). " + run.current.question.prompt().replace("?", Integer.toString(answer)) + "  The safe path continues."), false);
+            player.sendMessage(Text.literal("Explanation: " + explain(run.current.question)), false);
+            run.gateResolved = false;
+            run.promptShownStage = -1;
+            run.fallPending = false;
+            advanceRun(player, run);
+            return;
+        }
+
+        PlayerProfile profile = ProfileStore.get(player.getServer(), player.getUuid());
+        boolean isFirstReviewForThisPrompt = run.recordedCardIds.add(run.current.question.id());
+        profile.wrongChoices++;
+        if (isFirstReviewForThisPrompt) {
+            profile.firstTryWrong++;
+            FsrsReviews.rate(profile, run.current.question.id(), Rating.AGAIN);
+        }
+        ProfileStore.save(player.getServer(), player.getUuid());
+        run.fallPending = true;
+        player.sendMessage(Text.literal("Wrong answer! The correct answer was " + run.current.question.answer() + ". Hint: " + run.current.question.hint()), false);
+        player.sendMessage(Text.literal("Review: " + explain(run.current.question)), false);
+    }
+
     private static ServerPlayerEntity getPlayer(ServerCommandSource source) {
         Entity entity = source.getEntity();
         if (entity instanceof ServerPlayerEntity player) return player;
@@ -169,20 +256,17 @@ public final class MathParkourMod implements ModInitializer {
     private static StartSpec parseStartSpec(String raw) {
         if (raw == null) return new StartSpec(GameMode.MIXED, null);
         String s = raw.trim().toLowerCase();
-        // direct keywords
         switch (s) {
             case "math": return new StartSpec(GameMode.MATH, null);
             case "squares": return new StartSpec(GameMode.SQUARES, null);
             case "mixed": return new StartSpec(GameMode.MIXED, null);
         }
-        // numeric like "6" -> all facts involving 6 (multiplication/division)
         if (s.matches("^\\d{1,2}$")) {
             try {
                 int n = Integer.parseInt(s);
                 return new StartSpec(GameMode.MATH, n);
             } catch (NumberFormatException ignored) { }
         }
-        // patterns: table6, times6, table:6, times:6, sq6
         if (s.matches("^(table|times|t)[:_\\-]?\\d{1,2}$")) {
             int n = Integer.parseInt(s.replaceAll("\\D+", ""));
             return new StartSpec(GameMode.MATH, n);
@@ -191,7 +275,6 @@ public final class MathParkourMod implements ModInitializer {
             int n = Integer.parseInt(s.replaceAll("\\D+", ""));
             return new StartSpec(GameMode.SQUARES, n);
         }
-        // fallback to mixed
         return new StartSpec(GameMode.MIXED, null);
     }
 
@@ -205,7 +288,6 @@ public final class MathParkourMod implements ModInitializer {
 
         HUB_ACTIONS.clear();
 
-        // main platform
         int platformX1 = baseX - 6;
         int platformX2 = baseX + 12;
         int platformZ1 = baseZ - 6;
@@ -216,7 +298,6 @@ public final class MathParkourMod implements ModInitializer {
             }
         }
 
-        // center pad
         for (int x = baseX - 2; x <= baseX + 2; x++) {
             for (int z = baseZ - 2; z <= baseZ + 2; z++) {
                 place(world, x, baseY + 1, z, Blocks.YELLOW_CONCRETE);
@@ -225,31 +306,26 @@ public final class MathParkourMod implements ModInitializer {
 
         int plateY = baseY + 1;
 
-        // math (red)
         BlockPos mathPlate = new BlockPos(baseX - 4, plateY, baseZ + 4);
         place(world, mathPlate.getX(), mathPlate.getY(), mathPlate.getZ(), Blocks.RED_CONCRETE);
         place(world, mathPlate.getX(), mathPlate.getY() + 1, mathPlate.getZ(), Blocks.STONE_PRESSURE_PLATE);
         HUB_ACTIONS.put(mathPlate, HubAction.START_MATH);
 
-        // squares (yellow)
         BlockPos squarePlate = new BlockPos(baseX - 1, plateY, baseZ + 4);
         place(world, squarePlate.getX(), squarePlate.getY(), squarePlate.getZ(), Blocks.YELLOW_CONCRETE);
         place(world, squarePlate.getX(), squarePlate.getY() + 1, squarePlate.getZ(), Blocks.STONE_PRESSURE_PLATE);
         HUB_ACTIONS.put(squarePlate, HubAction.START_SQUARES);
 
-        // mixed (blue)
         BlockPos mixedPlate = new BlockPos(baseX + 5, plateY, baseZ + 4);
         place(world, mixedPlate.getX(), mixedPlate.getY(), mixedPlate.getZ(), Blocks.BLUE_CONCRETE);
         place(world, mixedPlate.getX(), mixedPlate.getY() + 1, mixedPlate.getZ(), Blocks.STONE_PRESSURE_PLATE);
         HUB_ACTIONS.put(mixedPlate, HubAction.START_MIXED);
 
-        // shop (purple)
         BlockPos shopPlate = new BlockPos(baseX - 4, plateY, baseZ - 4);
         place(world, shopPlate.getX(), shopPlate.getY(), shopPlate.getZ(), Blocks.PURPLE_CONCRETE);
         place(world, shopPlate.getX(), shopPlate.getY() + 1, shopPlate.getZ(), Blocks.STONE_PRESSURE_PLATE);
         HUB_ACTIONS.put(shopPlate, HubAction.SHOP);
 
-        // summon pet (pink)
         BlockPos petPlate = new BlockPos(baseX + 5, plateY, baseZ - 4);
         place(world, petPlate.getX(), petPlate.getY(), petPlate.getZ(), Blocks.PINK_CONCRETE);
         place(world, petPlate.getX(), petPlate.getY() + 1, petPlate.getZ(), Blocks.STONE_PRESSURE_PLATE);
@@ -264,30 +340,27 @@ public final class MathParkourMod implements ModInitializer {
         MinecraftServer server = player.getServer();
         ServerWorld world = player.getServerWorld();
         PlayerProfile profile = ProfileStore.get(server, player.getUuid());
-        List<MathQuestion> chosen = chooseQuestions(profile, QUESTIONS_PER_COURSE, mode, focusNumber);
-        List<DoorRound> rounds = new ArrayList<>();
-        for (MathQuestion question : chosen) {
-            List<Integer> options = MathQuestion.makeOptions(question, RANDOM);
-            rounds.add(new DoorRound(question, options, options.indexOf(question.answer())));
-        }
 
         int baseX = player.getBlockX() + 8;
         int centerZ = player.getBlockZ();
-        int endX = baseX + STAGE_SPACING * rounds.size() + 5;
+        int endX = baseX + STAGE_SPACING + 5;
         int floorY = chooseFloorY(world, baseX, endX, centerZ, player.getBlockY());
         if (floorY < 0) {
             player.sendMessage(Text.literal("There isn't enough vertical room to build the course here. Try a lower, flatter area."), false);
             return;
         }
 
-        buildCourse(world, baseX, floorY, centerZ, rounds);
-        CourseRun run = new CourseRun(baseX, floorY, centerZ, world.getRegistryKey(), rounds);
+        CourseRun run = new CourseRun(baseX, floorY, centerZ, world.getRegistryKey(), mode, focusNumber);
+        run.current = generateRound(profile, mode, focusNumber, run);
+        run.typedMode = TYPED_MODE.getOrDefault(player.getUuid(), false);
+        spawnGate(world, run, 0);
+
         ACTIVE_RUNS.put(player.getUuid(), run);
         teleport(player, baseX + 1.5, floorY + 1.0, centerZ + 0.5);
 
         String modeLabel = mode.label + (focusNumber == null ? "" : (" (" + focusNumber + ")"));
-        player.sendMessage(Text.literal("Math Parkour started in " + modeLabel + " mode: walk through the colored doors. Wrong doors drop into lava and send you to the checkpoint."), false);
-        player.sendMessage(Text.literal("Use /mathparkour hint or /mathparkour stats. Earn points. Spend them in /mathparkour shop."), false);
+        player.sendMessage(Text.literal("Math Parkour endless run started in " + modeLabel + " mode: " + (run.typedMode ? "type the answer with /mathparkour answer <number>." : "walk through the colored doors.") + " Wrong answers drop into lava and send you to the checkpoint."), false);
+        player.sendMessage(Text.literal("Use /mathparkour hint or /mathparkour stats. Earn points. Use /mathparkour stop to end the run."), false);
     }
 
     private static int chooseFloorY(ServerWorld world, int startX, int endX, int centerZ, int playerY) {
@@ -302,88 +375,20 @@ public final class MathParkourMod implements ModInitializer {
         return floorY <= upperSafeLimit ? floorY : -1;
     }
 
-    private static List<MathQuestion> chooseQuestions(PlayerProfile profile, int count, GameMode mode, Integer focusNumber) {
-        Instant now = Instant.now();
-        List<MathQuestion> due = new ArrayList<>();
-        List<MathQuestion> fresh = new ArrayList<>();
-        List<MathQuestion> future = new ArrayList<>();
-
-        for (MathQuestion q : CATALOG) {
-            if (focusNumber != null) {
-                if (!matchesFocus(q, focusNumber)) continue;
-            }
-            if (!matchesMode(q, mode)) continue;
-
-            if (!profile.cards.containsKey(q.id())) {
-                fresh.add(q);
-                continue;
-            }
-
-            Instant dueAt = FsrsReviews.dueAt(profile, q.id());
-            if (!dueAt.isAfter(now)) due.add(q);
-            else future.add(q);
-        }
-
-        due.sort(Comparator.comparing((MathQuestion q) -> FsrsReviews.dueAt(profile, q.id())));
-        Collections.shuffle(fresh, RANDOM);
-        future.sort(Comparator.comparing((MathQuestion q) -> FsrsReviews.dueAt(profile, q.id())));
-
-        List<MathQuestion> interleaved = new ArrayList<>();
-        int i = 0, j = 0, k = 0;
-        while (interleaved.size() < count && (i < due.size() || j < fresh.size() || k < future.size())) {
-            if (i < due.size()) {
-                interleaved.add(due.get(i++));
-                if (interleaved.size() >= count) break;
-            }
-            if (j < fresh.size()) {
-                interleaved.add(fresh.get(j++));
-                if (interleaved.size() >= count) break;
-            }
-            if (k < future.size()) {
-                interleaved.add(future.get(k++));
-            }
-        }
-
-        List<MathQuestion> result = new ArrayList<>();
-        Set<String> used = new LinkedHashSet<>();
-        for (MathQuestion q : interleaved) addUnique(result, used, q);
-        if (result.size() >= count) return result.subList(0, count);
-
-        for (MathQuestion q : CATALOG) {
-            if (focusNumber != null && !matchesFocus(q, focusNumber)) continue;
-            if (!matchesMode(q, mode) || used.contains(q.id())) continue;
-            addUnique(result, used, q);
-            if (result.size() >= count) break;
-        }
-        return result;
+    private static DoorRound generateRound(PlayerProfile profile, GameMode mode, Integer focusNumber, CourseRun run) {
+        List<MathQuestion> chosen = chooseQuestions(profile, 1, mode, focusNumber);
+        MathQuestion q = chosen.isEmpty() ? MathQuestion.catalog().get(RANDOM.nextInt(MathQuestion.catalog().size())) : chosen.get(0);
+        List<Integer> options = MathQuestion.makeOptions(q, RANDOM);
+        return new DoorRound(q, options, options.indexOf(q.answer()));
     }
 
-    private static boolean matchesFocus(MathQuestion q, int n) {
-        if (q.id().startsWith("mul:") || q.id().startsWith("div:")) {
-            return q.operand1() == n || q.operand2() == n;
-        }
-        if (q.id().startsWith("sq:")) {
-            return q.operand1() == n;
-        }
-        return false;
-    }
+    private static void spawnGate(ServerWorld world, CourseRun run, int stageIndex) {
+        int stageX = run.baseX + stageIndex * STAGE_SPACING;
+        int gateX = stageX + GATE_OFFSET;
+        int centerZ = run.centerZ;
+        int floorY = run.floorY;
 
-    private static boolean matchesMode(MathQuestion q, GameMode mode) {
-        if (mode == GameMode.MIXED) return true;
-        if (mode == GameMode.MATH) return q.id().startsWith("mul:") || q.id().startsWith("div:");
-        if (mode == GameMode.SQUARES) return q.id().startsWith("sq:");
-        return true;
-    }
-
-    private static void addUnique(List<MathQuestion> list, Set<String> used, MathQuestion question) {
-        if (used.add(question.id())) list.add(question);
-    }
-
-    private static void buildCourse(ServerWorld world, int baseX, int floorY, int centerZ, List<DoorRound> rounds) {
-        int finishStart = baseX + STAGE_SPACING * rounds.size();
-        int endX = finishStart + 5;
-
-        for (int x = baseX - 2; x <= endX + 1; x++) {
+        for (int x = stageX - 2; x <= stageX + 6; x++) {
             for (int z = centerZ - 8; z <= centerZ + 8; z++) {
                 for (int y = floorY - 5; y <= floorY + 5; y++) {
                     BlockPos pos = new BlockPos(x, y, z);
@@ -392,73 +397,65 @@ public final class MathParkourMod implements ModInitializer {
             }
         }
 
-        for (int x = baseX - 1; x <= endX + 1; x++) {
+        for (int x = stageX - 1; x <= stageX + 6; x++) {
             for (int z = centerZ - 7; z <= centerZ + 7; z++) {
                 place(world, x, floorY - 5, z, Blocks.OBSIDIAN);
             }
         }
         for (int y = floorY - 4; y <= floorY + 1; y++) {
-            for (int x = baseX - 1; x <= endX + 1; x++) {
+            for (int x = stageX - 1; x <= stageX + 6; x++) {
                 place(world, x, y, centerZ - 7, Blocks.OBSIDIAN);
                 place(world, x, y, centerZ + 7, Blocks.OBSIDIAN);
             }
             for (int z = centerZ - 7; z <= centerZ + 7; z++) {
-                place(world, baseX - 1, y, z, Blocks.OBSIDIAN);
-                place(world, endX + 1, y, z, Blocks.OBSIDIAN);
+                place(world, stageX - 1, y, z, Blocks.OBSIDIAN);
+                place(world, stageX + 6, y, z, Blocks.OBSIDIAN);
             }
         }
-        for (int x = baseX; x <= endX; x++) {
+        for (int x = stageX; x <= stageX + 6; x++) {
             for (int z = centerZ - 6; z <= centerZ + 6; z++) {
                 place(world, x, floorY - 4, z, Blocks.LAVA);
             }
         }
 
-        for (int index = 0; index < rounds.size(); index++) {
-            int stageX = baseX + index * STAGE_SPACING;
-            int gateX = stageX + GATE_OFFSET;
-            DoorRound round = rounds.get(index);
+        floor(world, stageX, gateX - 1, centerZ - 5, centerZ + 5, floorY, Blocks.STONE_BRICKS);
 
-            floor(world, stageX, gateX - 1, centerZ - 5, centerZ + 5, floorY, Blocks.STONE_BRICKS);
-
-            for (int z = centerZ - 6; z <= centerZ + 6; z++) {
-                for (int y = floorY + 1; y <= floorY + 2; y++) {
-                    boolean opening = false;
-                    for (int lane = 0; lane < 3; lane++) {
-                        int laneZ = centerZ + laneOffset(lane);
-                        if (Math.abs(z - laneZ) <= 1) opening = true;
-                    }
-                    if (!opening) place(world, gateX, y, z, Blocks.STONE_BRICKS);
+        for (int z = centerZ - 6; z <= centerZ + 6; z++) {
+            for (int y = floorY + 1; y <= floorY + 2; y++) {
+                boolean opening = false;
+                for (int lane = 0; lane < 3; lane++) {
+                    int laneZ = centerZ + laneOffset(lane);
+                    if (Math.abs(z - laneZ) <= 1) opening = true;
                 }
+                if (!opening) place(world, gateX, y, z, Blocks.STONE_BRICKS);
             }
-
-            for (int lane = 0; lane < 3; lane++) {
-                int laneZ = centerZ + laneOffset(lane);
-                for (int dz = -1; dz <= 1; dz++) {
-                    place(world, gateX, floorY + 3, laneZ + dz, LANE_COLORS[lane]);
-                }
-            }
-
-            for (int x = gateX + 1; x <= gateX + GAP_LENGTH; x++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    place(world, x, floorY, centerZ + laneOffset(round.correctLane) + dz, Blocks.STONE_BRICKS);
-                }
-                place(world, gateX + 2, floorY, centerZ + laneOffset(round.correctLane), LANE_COLORS[round.correctLane]);
-            }
-
-            floor(world, gateX + GAP_LENGTH + 1, gateX + GAP_LENGTH + 2,
-                    centerZ - 5, centerZ + 5, floorY, Blocks.STONE_BRICKS);
         }
 
-        floor(world, finishStart, finishStart + 5, centerZ - 5, centerZ + 5, floorY, Blocks.GOLD_BLOCK);
-        place(world, finishStart + 2, floorY + 1, centerZ, Blocks.BEACON);
+        for (int lane = 0; lane < 3; lane++) {
+            int laneZ = centerZ + laneOffset(lane);
+            for (int dz = -1; dz <= 1; dz++) place(world, gateX, floorY + 3, laneZ + dz, LANE_COLORS[lane]);
+        }
+
+        for (int x = gateX + 1; x <= gateX + GAP_LENGTH; x++) {
+            for (int dz = -1; dz <= 1; dz++) place(world, x, floorY, centerZ + laneOffset(run.current.correctLane) + dz, Blocks.STONE_BRICKS);
+            place(world, gateX + 2, floorY, centerZ + laneOffset(run.current.correctLane), LANE_COLORS[run.current.correctLane]);
+        }
+
+        floor(world, gateX + GAP_LENGTH + 1, gateX + GAP_LENGTH + 2, centerZ - 5, centerZ + 5, floorY, Blocks.STONE_BRICKS);
     }
 
-    private static int laneOffset(int lane) {
-        return switch (lane) {
-            case 0 -> -4;
-            case 1 -> 0;
-            default -> 4;
-        };
+    private static boolean isPlayerAtGate(ServerPlayerEntity player, CourseRun run) {
+        int stageX = run.baseX + run.stage * STAGE_SPACING;
+        int gateX = stageX + GATE_OFFSET;
+        return player.getX() >= gateX + 0.05 && player.getX() <= gateX + GAP_LENGTH + 0.8
+                && player.getY() >= run.floorY && player.getY() <= run.floorY + 4;
+    }
+
+    private static void advanceRun(ServerPlayerEntity player, CourseRun run) {
+        run.stage++;
+        PlayerProfile profile = ProfileStore.get(player.getServer(), player.getUuid());
+        run.current = generateRound(profile, run.mode, run.focusNumber, run);
+        spawnGate((ServerWorld) player.getServerWorld(), run, run.stage);
     }
 
     private static void floor(ServerWorld world, int x1, int x2, int z1, int z2, int y, Block block) {
@@ -473,7 +470,6 @@ public final class MathParkourMod implements ModInitializer {
 
     private static void tickPlayers(MinecraftServer server) {
         for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            // Hub trigger checks (allow hub actions even when not in a run)
             boolean hubHandled = false;
             for (Map.Entry<BlockPos, HubAction> entry : HUB_ACTIONS.entrySet()) {
                 BlockPos trigger = entry.getKey();
@@ -482,7 +478,7 @@ public final class MathParkourMod implements ModInitializer {
                         && player.getBlockY() == trigger.getY() + 1) {
                     triggerHubAction(player, entry.getValue());
                     hubHandled = true;
-                    break; // one hub action per tick
+                    break;
                 }
             }
             if (hubHandled) continue;
@@ -500,37 +496,38 @@ public final class MathParkourMod implements ModInitializer {
                 int checkpointX = run.baseX + run.stage * STAGE_SPACING + 1;
                 teleport(player, checkpointX + 0.5, run.floorY + 1.0, run.centerZ + 0.5);
                 run.fallPending = false;
-                run.promptShownStage = -1;
-                run.gateResolved = false;
                 if (questionMiss) {
                     player.sendMessage(Text.literal("Checkpoint restored. Retry the same fact; this immediate retry won't add a second FSRS review."), false);
                 } else {
-                    player.sendMessage(Text.literal("Parkour checkpoint restored. Your review was not marked wrong."), false);
+                    player.sendMessage(Text.literal("Run checkpoint restored."), false);
                 }
                 continue;
             }
 
-            if (run.stage >= run.rounds.size()) continue;
-            DoorRound round = run.rounds.get(run.stage);
             int stageX = run.baseX + run.stage * STAGE_SPACING;
             int gateX = stageX + GATE_OFFSET;
-
             if (run.promptShownStage != run.stage
                     && player.getX() >= stageX
                     && player.getX() < gateX
                     && player.getY() >= run.floorY
                     && player.getY() <= run.floorY + 4) {
-                showQuestion(player, run.stage, run.rounds.size(), round);
+                showQuestion(player, run.stage, run.current, run.typedMode);
                 run.promptShownStage = run.stage;
             }
 
-            if (!run.gateResolved && !run.fallPending
-                    && player.getX() >= gateX + 0.05
-                    && player.getX() <= gateX + GAP_LENGTH + 0.8) {
+            if (!run.typedMode && !run.gateResolved && !run.fallPending && isPlayerAtGate(player, run)) {
                 int lane = laneAt(player.getZ() - run.centerZ);
-                if (lane >= 0) resolveDoor(server, player, run, round, lane);
+                if (lane >= 0) resolveDoor(server, player, run, lane);
             }
         }
+    }
+
+    private static int laneOffset(int lane) {
+        return switch (lane) {
+            case 0 -> -4;
+            case 1 -> 0;
+            default -> 4;
+        };
     }
 
     private static int laneAt(double relativeZ) {
@@ -540,68 +537,59 @@ public final class MathParkourMod implements ModInitializer {
         return -1;
     }
 
-    private static void showQuestion(ServerPlayerEntity player, int stage, int total, DoorRound round) {
-        player.sendMessage(Text.literal("Question " + (stage + 1) + "/" + total + ": " + round.question.prompt()), false);
+    private static void showQuestion(ServerPlayerEntity player, int stage, DoorRound round, boolean typedMode) {
+        player.sendMessage(Text.literal("Question " + (stage + 1) + ": " + round.question.prompt()), false);
+        if (typedMode) {
+            player.sendMessage(Text.literal("Type the answer with /mathparkour answer <number>. Set confidence with /mathparkour conf <1|2|3>."), true);
+            return;
+        }
         player.sendMessage(Text.literal("LEFT / RED: " + round.options.get(0)
                 + "    CENTER / YELLOW: " + round.options.get(1)
                 + "    RIGHT / GREEN: " + round.options.get(2)), false);
         player.sendMessage(Text.literal("Pick the answer lane. Use /mathparkour hint if you need a clue."), true);
     }
 
-    private static void resolveDoor(MinecraftServer server, ServerPlayerEntity player, CourseRun run, DoorRound round, int lane) {
+    private static void resolveDoor(MinecraftServer server, ServerPlayerEntity player, CourseRun run, int lane) {
         run.gateResolved = true;
         PlayerProfile profile = ProfileStore.get(server, player.getUuid());
-        boolean isFirstReviewForThisPrompt = run.recordedCardIds.add(round.question.id());
+        boolean isFirstReviewForThisPrompt = run.recordedCardIds.add(run.current.question.id());
 
-        if (lane == round.correctLane) {
+        if (lane == run.current.correctLane) {
             profile.correctChoices++;
             int earned = 5 + (isFirstReviewForThisPrompt ? 5 : 0);
             earnPoints(profile, earned);
             if (isFirstReviewForThisPrompt) {
                 profile.firstTryCorrect++;
-                FsrsReviews.rate(profile, round.question.id(), Rating.GOOD);
+                FsrsReviews.rate(profile, run.current.question.id(), Rating.GOOD);
             }
             ProfileStore.save(server, player.getUuid());
-            player.sendMessage(Text.literal("Correct! +" + earned + " points. " + round.question.prompt().replace("?", Integer.toString(round.question.answer())) + "  The safe path continues."), false);
-            player.sendMessage(Text.literal("Explanation: " + explain(round.question)), false);
+            player.sendMessage(Text.literal("Correct! +" + earned + " points. " + run.current.question.prompt().replace("?", Integer.toString(run.current.question.answer())) + "  The safe path continues."), false);
+            player.sendMessage(Text.literal("Explanation: " + explain(run.current.question)), false);
 
-            run.stage++;
-            run.promptShownStage = -1;
             run.gateResolved = false;
-            if (run.stage >= run.rounds.size()) finishCourse(server, player, run, profile);
+            run.promptShownStage = -1;
+            run.fallPending = false;
+            advanceRun(player, run);
         } else {
             profile.wrongChoices++;
             if (isFirstReviewForThisPrompt) {
                 profile.firstTryWrong++;
-                FsrsReviews.rate(profile, round.question.id(), Rating.AGAIN);
+                FsrsReviews.rate(profile, run.current.question.id(), Rating.AGAIN);
             }
             ProfileStore.save(server, player.getUuid());
             run.fallPending = true;
-            player.sendMessage(Text.literal("Wrong door! The floor drops into lava. Hint: " + round.question.hint()), false);
-            player.sendMessage(Text.literal("Review: " + explain(round.question)), false);
+            player.sendMessage(Text.literal("Wrong door! The floor drops into lava. Hint: " + run.current.question.hint()), false);
+            player.sendMessage(Text.literal("Review: " + explain(run.current.question)), false);
         }
-    }
-
-    private static void finishCourse(MinecraftServer server, ServerPlayerEntity player, CourseRun run, PlayerProfile profile) {
-        profile.coursesCompleted++;
-        int finishBonus = 20;
-        earnPoints(profile, finishBonus);
-        ProfileStore.save(server, player.getUuid());
-        ACTIVE_RUNS.remove(player.getUuid());
-        int finishX = run.baseX + STAGE_SPACING * run.rounds.size() + 1;
-        teleport(player, finishX + 0.5, run.floorY + 1.0, run.centerZ + 0.5);
-        player.sendMessage(Text.literal("Course complete! +" + finishBonus + " points. Correct choices this run: " + run.rounds.size() + ". Your FSRS review history has been saved."), false);
-        player.sendMessage(Text.literal("Use /mathparkour stats to see your progress or /mathparkour shop to spend points."), false);
     }
 
     private static void sendHint(ServerPlayerEntity player) {
         CourseRun run = ACTIVE_RUNS.get(player.getUuid());
-        if (run == null || run.stage >= run.rounds.size()) {
-            player.sendMessage(Text.literal("Start a course with /mathparkour start before asking for a hint."), false);
+        if (run == null) {
+            player.sendMessage(Text.literal("Start a run with /mathparkour start before asking for a hint."), false);
             return;
         }
-        DoorRound round = run.rounds.get(run.stage);
-        player.sendMessage(Text.literal("Hint: " + round.question.hint()), false);
+        player.sendMessage(Text.literal("Hint: " + run.current.question.hint()), false);
     }
 
     private static void sendStats(ServerPlayerEntity player) {
@@ -613,6 +601,7 @@ public final class MathParkourMod implements ModInitializer {
                 + "; first-try wrong: " + profile.firstTryWrong
                 + "; all correct choices: " + profile.correctChoices
                 + "; wrong choices: " + profile.wrongChoices
+                + "; run stages: " + (ACTIVE_RUNS.get(player.getUuid()) != null ? ACTIVE_RUNS.get(player.getUuid()).stage : 0)
                 + "; completed courses: " + profile.coursesCompleted), false);
     }
 
@@ -629,29 +618,31 @@ public final class MathParkourMod implements ModInitializer {
         private final int floorY;
         private final int centerZ;
         private final net.minecraft.registry.RegistryKey<World> dimension;
-        private final List<DoorRound> rounds;
+        private final GameMode mode;
+        private final Integer focusNumber;
         private final Set<String> recordedCardIds = new HashSet<>();
+        private DoorRound current;
         private int stage = 0;
         private int promptShownStage = -1;
         private boolean fallPending = false;
         private boolean gateResolved = false;
+        private boolean typedMode = false;
 
         private CourseRun(int baseX, int floorY, int centerZ,
-                          net.minecraft.registry.RegistryKey<World> dimension, List<DoorRound> rounds) {
+                          net.minecraft.registry.RegistryKey<World> dimension, GameMode mode, Integer focusNumber) {
             this.baseX = baseX;
             this.floorY = floorY;
             this.centerZ = centerZ;
             this.dimension = dimension;
-            this.rounds = List.copyOf(rounds);
+            this.mode = mode;
+            this.focusNumber = focusNumber;
         }
     }
 
-    // Points helper
     private static void earnPoints(PlayerProfile profile, int amount) {
         profile.points += Math.max(0, amount);
     }
 
-    // Explanation helper
     private static String explain(MathQuestion q) {
         if (q.division()) {
             return q.operand1() + " ÷ " + q.operand2() + " = " + q.answer() + " because " + q.answer() + " × " + q.operand2() + " = " + q.operand1() + ".";
@@ -663,7 +654,6 @@ public final class MathParkourMod implements ModInitializer {
         return q.operand1() + " × " + q.operand2() + " = " + q.answer() + ".";
     }
 
-    // Shop UI
     private static void showShop(ServerPlayerEntity player) {
         PlayerProfile profile = ProfileStore.get(player.getServer(), player.getUuid());
         player.sendMessage(Text.literal("Math Parkour Shop — points: " + profile.points), false);
@@ -748,12 +738,11 @@ public final class MathParkourMod implements ModInitializer {
         }
     }
 
-    // Hub trigger handler
     private static void triggerHubAction(ServerPlayerEntity player, HubAction action) {
         switch (action) {
             case START_MATH -> startCourse(player, GameMode.MATH, null);
             case START_SQUARES -> startCourse(player, GameMode.SQUARES, null);
-            case START_SCIENCE -> startCourse(player, GameMode.MIXED, null); // science removed -> default to mixed
+            case START_SCIENCE -> startCourse(player, GameMode.MIXED, null);
             case START_MIXED -> startCourse(player, GameMode.MIXED, null);
             case SHOP -> showShop(player);
             case SUMMON_WOLF -> {
@@ -767,7 +756,6 @@ public final class MathParkourMod implements ModInitializer {
         }
     }
 
-    // Simple models
     private static final class ShopItem {
         final String name;
         final int price;

@@ -15,6 +15,8 @@ import net.minecraft.entity.EntityType;
 import net.minecraft.entity.passive.WolfEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
+import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
@@ -50,8 +52,7 @@ public final class MathParkourMod implements ModInitializer {
     private static final int STAGE_SPACING = 8;
     private static final int GATE_OFFSET = 1;
     private static final int GAP_LENGTH = 3;
-    // How long (in server ticks) the question should flash on the player's action bar when shown.
-    private static final int FLASH_TICKS = 40; // ~2 seconds at 20 TPS
+    private static final int FLASH_TICKS = 40;
 
     private static final List<MathQuestion> CATALOG = MathQuestion.catalog();
     private static final Random RANDOM = new Random();
@@ -65,7 +66,6 @@ public final class MathParkourMod implements ModInitializer {
             Blocks.LIME_WOOL
     };
 
-    // Shop catalog
     private static final Map<String, ShopItem> SHOP = new HashMap<>();
     static {
         SHOP.put("pet_wolf", new ShopItem("Wolf Pet", 50, "Summon a friendly wolf pet near you.", ItemKind.PET));
@@ -73,7 +73,6 @@ public final class MathParkourMod implements ModInitializer {
         SHOP.put("toy_ball", new ShopItem("Ball (Slime)", 10, "A bouncy toy.", ItemKind.TOY));
     }
 
-    // Hub triggers (base block position => action). buildHub populates this.
     private static final Map<BlockPos, HubAction> HUB_ACTIONS = new HashMap<>();
 
     @Override
@@ -494,7 +493,6 @@ public final class MathParkourMod implements ModInitializer {
                 continue;
             }
 
-            // flash the prompt on the action bar while flashTicksLeft > 0
             if (run.promptShownStage == run.stage && run.flashTicksLeft > 0 && run.current != null) {
                 player.sendMessage(Text.literal(run.current.question.prompt()), true);
                 run.flashTicksLeft--;
@@ -549,6 +547,7 @@ public final class MathParkourMod implements ModInitializer {
 
     private static void showQuestion(ServerPlayerEntity player, int stage, DoorRound round, boolean typedMode) {
         player.sendMessage(Text.literal("Question " + (stage + 1) + ": " + round.question.prompt()), false);
+        sendCenterTitle(player, round.question.prompt());
         if (typedMode) {
             player.sendMessage(Text.literal("Type the answer with /mathparkour answer <number>. Set confidence with /mathparkour conf <1|2|3>."), true);
             return;
@@ -557,6 +556,11 @@ public final class MathParkourMod implements ModInitializer {
                 + "    CENTER / YELLOW: " + round.options.get(1)
                 + "    RIGHT / GREEN: " + round.options.get(2)), false);
         player.sendMessage(Text.literal("Pick the answer lane. Use /mathparkour hint if you need a clue."), true);
+    }
+
+    private static void sendCenterTitle(ServerPlayerEntity player, String message) {
+        player.networkHandler.sendPacket(new TitleFadeS2CPacket(5, 40, 5));
+        player.networkHandler.sendPacket(new TitleS2CPacket(Text.literal(message)));
     }
 
     private static void resolveDoor(MinecraftServer server, ServerPlayerEntity player, CourseRun run, int lane) {
@@ -637,7 +641,6 @@ public final class MathParkourMod implements ModInitializer {
         private boolean fallPending = false;
         private boolean gateResolved = false;
         private boolean typedMode = false;
-        // remaining ticks to flash the prompt on the action bar
         private int flashTicksLeft = 0;
 
         private CourseRun(int baseX, int floorY, int centerZ,
